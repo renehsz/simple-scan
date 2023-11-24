@@ -626,6 +626,19 @@ public class Scanner : Object
         return false;
     }
 
+    private bool set_int_array_option (Sane.Handle handle, Sane.OptionDescriptor option, Sane.Int option_index, double [] values)
+    {
+        return_val_if_fail (option.type == Sane.ValueType.INT, false);
+
+        var optlen = option.size / sizeof (Sane.Word);
+        var optval = new Sane.Word[optlen];
+        for (var i = 0; i < optlen; i++)
+            optval[i] = (Sane.Word) (values[i] + 0.5);
+
+        var status = Sane.control_option (handle, option_index, Sane.Action.SET_VALUE, optval, null);
+        return status == Sane.Status.GOOD;
+    }
+
     private void log_option (Sane.Int index, Sane.OptionDescriptor option)
     {
         var s = "Option %d:".printf ((int) index);
@@ -1216,37 +1229,135 @@ public class Scanner : Object
             if (option != null && job.page_height > 0.0)
                 set_fixed_or_int_option (handle, option, index, convert_page_size (option, job.page_height, job.dpi), null);
 
-            option = get_option_by_name (handle, Sane.NAME_BRIGHTNESS, out index);
-            if (option != null)
+            var option_brightness = get_option_by_name (handle, Sane.NAME_BRIGHTNESS, out index);
+            var option_contrast = get_option_by_name (handle, Sane.NAME_CONTRAST, out index);
+            if (option_brightness != null && option_contrast != null)
             {
+                // Brightness
+                option = option_brightness;
                 if (option.type == Sane.ValueType.FIXED)
                 {
                     var brightness = scale_fixed (-100, 100, option, job.brightness);
                     set_fixed_option (handle, option, index, brightness, null);
+                    debug ("Setting brightness to %f", brightness);
                 }
                 else if (option.type == Sane.ValueType.INT)
                 {
                     var brightness = scale_int (-100, 100, option, job.brightness);
                     set_int_option (handle, option, index, brightness, null);
+                    debug ("Setting brightness to %d", brightness);
                 }
                 else
                     warning ("Unable to set brightness, please file a bug");
-            }
-            option = get_option_by_name (handle, Sane.NAME_CONTRAST, out index);
-            if (option != null)
-            {
+
+                // Contrast
+                option = option_contrast;
                 if (option.type == Sane.ValueType.FIXED)
                 {
                     var contrast = scale_fixed (-100, 100, option, job.contrast);
                     set_fixed_option (handle, option, index, contrast, null);
+                    debug ("Setting contrast to %f", contrast);
                 }
                 else if (option.type == Sane.ValueType.INT)
                 {
                     var contrast = scale_int (-100, 100, option, job.contrast);
                     set_int_option (handle, option, index, contrast, null);
+                    debug ("Setting contrast to %d", contrast);
                 }
                 else
                     warning ("Unable to set contrast, please file a bug");
+            }
+
+            // Custom gamma is needed if brightness or contrast is set and the scanner does not support setting brightness or contrast directly
+            var needs_custom_gamma = (job.brightness != 0 || job.contrast != 0) && (option_brightness == null || option_contrast == null);
+            if (needs_custom_gamma) {
+                option = get_option_by_name (handle, Sane.NAME_CUSTOM_GAMMA, out index);
+                if (option != null)
+                {
+                    debug ("Setting custom gamma to %s", needs_custom_gamma ? "true" : "false");
+                    if (option.type == Sane.ValueType.BOOL) {
+                        set_bool_option (handle, option, index, needs_custom_gamma, null);
+
+                        // Depends on printer model
+                        const int gamma_table_size = 1024,
+                            gamma_table_bit_depth = 16;
+
+                        var brightness = job.brightness / 100.0;
+                        var contrast = job.contrast / 100.0;
+                        if (brightness < -1.0)
+                            brightness = -1.0;
+                        else if (brightness > 1.0)
+                            brightness = 1.0;
+                        if (contrast < -0.9999)
+                            contrast = -0.9999;
+                        else if (contrast > 0.9999)
+                            contrast = 0.9999;
+
+                        // Calculate a custom gamma table (stupid)
+                        var gamma_table = new double [gamma_table_size];
+                        for (var x = 1; x <= gamma_table_size; x++)
+                        {
+                            var max_val = Math.pow(2.0, gamma_table_bit_depth);
+
+                            var y = (Math.tan(Math.PI / 2.0 * (contrast + 1.0) / 2.0) * (x - gamma_table_size / 2.0) / gamma_table_size + brightness + 0.5) * max_val;
+
+                            if (y < 1.0)
+                                y = 1.0;
+                            else if (y > max_val)
+                                y = max_val;
+
+                            var yi = (int) (y - 1.0);
+
+                            debug ("gamma_table[%d] = %d", x, yi);
+                            gamma_table[x] = yi;
+                        }
+
+                        var gamma_vector_has_been_set = false;
+
+                        // for grayscale
+                        option = get_option_by_name (handle, Sane.NAME_GAMMA_VECTOR, out index);
+                        if (option != null)
+                        {
+                            debug ("Setting gamma vector");
+                            if (set_int_array_option (handle, option, index, gamma_table))
+                                gamma_vector_has_been_set = true;
+                            else
+                                warning ("Unable to set gamma vector");
+                        }
+
+                        // for color
+                        option = get_option_by_name (handle, Sane.NAME_GAMMA_VECTOR_R, out index);
+                        if (option != null)
+                        {
+                            debug ("Setting gamma vector R");
+                            if (set_int_array_option (handle, option, index, gamma_table))
+                                gamma_vector_has_been_set = true;
+                            else
+                                warning ("Unable to set gamma vector R");
+                        }
+                        option = get_option_by_name (handle, Sane.NAME_GAMMA_VECTOR_G, out index);
+                        if (option != null)
+                        {
+                            debug ("Setting gamma vector G");
+                            if (set_int_array_option (handle, option, index, gamma_table))
+                                gamma_vector_has_been_set = true;
+                            else
+                                warning ("Unable to set gamma vector G");
+                        }
+                        option = get_option_by_name (handle, Sane.NAME_GAMMA_VECTOR_B, out index);
+                        if (option != null)
+                        {
+                            debug ("Setting gamma vector B");
+                            if (set_int_array_option (handle, option, index, gamma_table))
+                                gamma_vector_has_been_set = true;
+                            else
+                                warning ("Unable to set gamma vector B");
+                        }
+
+                        if (!gamma_vector_has_been_set)
+                            warning ("Unable to set gamma vector!");
+                    }
+                }
             }
 
             /* Test scanner options (hoping will not effect other scanners...) */
